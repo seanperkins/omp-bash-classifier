@@ -90,7 +90,57 @@ One call per novel command, then cached for the session per (native-resolved cwd
 
 ## Configuration
 
-No plugin config. It reads the existing `bash.patterns` and `tools.approval` settings, so your current guardrails keep working. To exempt a command shape from classification entirely, give it a narrow `allow` rule in `bash.patterns` — the plugin honors those after the critical-pattern check and never pays for a model call.
+It reads the existing `bash.patterns` and `tools.approval` settings, so your current guardrails keep working. To exempt a command shape from classification entirely, give it a narrow `allow` rule in `bash.patterns` — the plugin honors those after the critical-pattern check and never pays for a model call.
+
+### Decision audit log
+
+Off by default. When enabled, every gate decision is appended as one JSON object per line to `~/.omp/logs/bash-classifier-audit.jsonl`, so a run can be reviewed afterwards — by hand, or by handing the file to a more capable model — to sort the prompts that represented real risk from the ones flagged too eagerly.
+
+Enable with either (env wins over config):
+
+```bash
+OMP_BASH_CLASSIFIER_AUDIT=1 omp                      # one process
+omp plugin config set omp-bash-classifier audit true  # persistent
+```
+
+Path override: `OMP_BASH_CLASSIFIER_AUDIT_PATH`, or the `auditPath` setting. An explicit `OMP_BASH_CLASSIFIER_AUDIT=0` overrides an enabled setting.
+
+Each record carries the evidence (`command` verbatim, native-resolved `cwd`, `envKeys`, `pty`, `timeoutSeconds`, `async`), the claim (`branch`, plus `verdict`/`reason`/`model`/`cached`/`latencyMs` when a model was asked, and `rule` when a static rule decided), and the effect (`outcome`). Quiet auto-allowed calls are logged too — over-flagging and under-flagging are only measurable together.
+
+`branch` names which link in the precedence chain decided: `overlength`, `deny-rule`, `critical-pattern`, `env-override`, `prompt-rule`, `narrow-allow`, `user-policy-prompt`, `classified`, `unclassified`, `internal-url-cwd`, `plugin-error`. `outcome` is `ran`, `approved`, `denied`, `blocked`, or `host-decides`.
+
+`host-decides` means the plugin deliberately stayed out and the native gate owned the call — do not read it as "the plugin allowed it". Those get a second `branch: "host-approval"` record with the host's real answer, correlated on `toolCallId`:
+
+```
+prompt-rule/host-decides   toolu_01X2…  git reset --hard HEAD   rule: git reset --hard* → prompt
+host-approval/denied       toolu_01X2…
+```
+
+#### Request context
+
+A verdict cannot be judged "too eager" without knowing what was being attempted, so two context sources are recorded — both for the reviewer only, never as classifier input.
+
+**Caller intent** (`branch: "intent"`) is emitted as its own row, joined on `toolCallId`, because the host exposes it on `tool_execution_start` — after the decision. It is metadata rather than a decision, so it carries no `outcome`. It is present whether or not the command ran:
+
+```
+classified/ran     toolu_01Ua…  git status --short
+intent             toolu_01Ua…  "Check working tree status"
+```
+
+**The user turn** is off even when the log is on, because a prompt carries far more sensitive material than a command line and enabling a decision log should not silently start transcribing the conversation:
+
+```bash
+OMP_BASH_CLASSIFIER_AUDIT_PROMPT=1 omp
+omp plugin config set omp-bash-classifier auditPrompt true
+```
+
+That adds `prompt` (capped at 2,000 chars), `promptLength`, and `promptTruncated` — the flag is explicit so a clipped prompt is never mistaken for the whole request. `input` fires in interactive mode only, so headless runs record `null`.
+
+#### Why context never reaches the classifier
+
+`CLASSIFIER_PROMPT` treats the command as untrusted DATA and scans it for steering — text addressing the reviewer, claims that something is a test or already approved, instructions to reinterpret the rules. Conversational context is reachable by anything that enters the transcript: tool output, file contents, repo instruction files, MCP results. Feeding it to the classifier would hand exactly that material the trusted channel the fence exists to deny, letting an injected "the user already approved this cleanup" justify a destructive command. The gate judges effects; stated purpose is for the human reading the log afterwards.
+
+Two invariants: caller-supplied `env` **values** are never written (key names only), and auditing never changes gate behavior — every write is best-effort and swallows its own errors, so an unwritable path cannot decide whether a command runs.
 
 Settings are read through the host module instance (`pi.pi.settings`). A plugin-local `import { settings }` resolves to a second copy of the singleton with no global instance and throws `Settings not initialized`, which would block every bash call. A session that legitimately has no global settings (SDK, isolated) is handled instead: the plugin logs one warning, honors no static rules, and classifies everything.
 

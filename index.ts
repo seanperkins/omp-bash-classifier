@@ -44,6 +44,10 @@
  *     than blocking every bash call.
  *   - Classification uses the `@tiny` model role — the role core reserves for
  *     online title/memory/classifier work — falling back to the session model.
+ *   - An opt-in decision audit log (off by default) records every branch taken,
+ *     including the quiet auto-allowed ones, so a run can be reviewed after the
+ *     fact for both over- and under-flagging. It is observational: a logging
+ *     fault can never change whether a command runs. See "Decision audit log".
  *
  * Fail-closed points: a command too long to display is blocked outright; an
  * `env` override, classifier error/timeout, and malformed verdict raise a
@@ -51,7 +55,11 @@
  * plugin throw always blocks. A command the gate could not judge is never
  * silently auto-run.
  */
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { resolveToCwd } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { extractLeadingCdTarget, tokenizeShellSegments } from "@oh-my-pi/pi-coding-agent/tools/shell-tokenize";
@@ -337,6 +345,154 @@ function remember(scoped: Map<string, Judgement>, key: string, judgement: Judgem
 	scoped.set(key, judgement);
 }
 
+// ---------------------------------------------------------------------------
+// Decision audit log (opt-in, off by default).
+//
+// Purpose: read back every gate decision afterwards — by hand or by handing the
+// file to a more capable reviewer model — and judge which prompts represented
+// real risk versus which were flagged too eagerly. That adjudication needs three
+// things per call, which is why each record carries all of them:
+//   evidence — the verbatim command, the natively-resolved cwd, execution shape
+//   claim    — which branch decided, and the verdict/reason if a model was asked
+//   effect   — what actually happened (ran silently, prompted, blocked)
+// Both over-flagging and under-flagging are only measurable if the quiet
+// auto-allowed calls are recorded too, so every decision is logged, not just
+// the ones that stopped to ask.
+//
+// Enable with either (env wins):
+//   OMP_BASH_CLASSIFIER_AUDIT=1
+//   omp plugin config set omp-bash-classifier audit true
+// Path override: OMP_BASH_CLASSIFIER_AUDIT_PATH, or the `auditPath` setting.
+//
+// Two invariants: `env` VALUES are never written (key names only — they hold
+// secrets, which is why the gate refuses to classify them in the first place),
+// and auditing never changes gate behavior. Every write is best-effort and
+// swallows its own errors: a full disk must not decide whether a command runs.
+// ---------------------------------------------------------------------------
+
+const PLUGIN_NAME = "omp-bash-classifier";
+const AUDIT_SCHEMA = 2;
+const DEFAULT_AUDIT_PATH = join(homedir(), ".omp", "logs", "bash-classifier-audit.jsonl");
+
+/** Which rule in the precedence chain decided this call. */
+type AuditBranch =
+	| "overlength"
+	| "deny-rule"
+	| "critical-pattern"
+	| "env-override"
+	| "prompt-rule"
+	| "narrow-allow"
+	| "user-policy-prompt"
+	| "classified"
+	| "unclassified"
+	| "internal-url-cwd"
+	| "plugin-error"
+	| "host-approval"
+	| "intent";
+
+/**
+ * What the decision did. `host-decides` marks the branches where this plugin
+ * deliberately stays out and the native gate owns the outcome — a reviewer must
+ * not read those as "the plugin allowed it". Join them to the paired
+ * `tool_approval_resolved` record on `toolCallId` to see what the host did.
+ */
+type AuditOutcome = "ran" | "approved" | "denied" | "blocked" | "host-decides";
+
+interface BashTarget {
+	toolCallId: string;
+	command: string;
+	cwd: string;
+	envKeys: string[];
+	pty: boolean;
+	timeout: number | undefined;
+	async: boolean;
+}
+
+/** Everything a reviewer needs about HOW the verdict was reached, when one was. */
+interface AuditTelemetry {
+	verdict?: Verdict;
+	reason?: string;
+	model?: string;
+	cached?: boolean;
+	latencyMs?: number;
+	rule?: { match: string; approval: BashPatternApproval };
+}
+
+interface AuditConfig {
+	enabled: boolean;
+	path: string;
+	/**
+	 * Record the user turn that preceded the call. Separate from `enabled`
+	 * because it is a real privacy escalation: a prompt carries far more
+	 * sensitive material than a command line, and enabling the decision log
+	 * should not silently start transcribing the conversation.
+	 */
+	prompts: boolean;
+}
+
+/** Prompts are unbounded; the command cap does not apply to them. */
+const AUDIT_MAX_PROMPT = 2000;
+
+/**
+ * Tri-state: `undefined` means "not set, defer to config" — distinct from an
+ * explicit `0`/`false`, which must be able to override an enabled setting.
+ */
+function envFlag(name: string): boolean | undefined {
+	const raw = process.env[name]?.trim().toLowerCase();
+	if (raw === undefined || raw === "") return undefined;
+	return !(raw === "0" || raw === "false" || raw === "off" || raw === "no");
+}
+
+// Resolution reads plugin config off disk, so memoize per cwd: this sits in the
+// hot path of every bash call.
+const auditConfigByCwd = new Map<string, Promise<AuditConfig>>();
+
+function resolveAuditConfig(cwd: string): Promise<AuditConfig> {
+	const memoized = auditConfigByCwd.get(cwd);
+	if (memoized) return memoized;
+	const pending = (async (): Promise<AuditConfig> => {
+		const envEnabled = envFlag("OMP_BASH_CLASSIFIER_AUDIT");
+		const envPrompts = envFlag("OMP_BASH_CLASSIFIER_AUDIT_PROMPT");
+		const envPath = process.env.OMP_BASH_CLASSIFIER_AUDIT_PATH?.trim();
+		let settingEnabled = false;
+		let settingPrompts = false;
+		let settingPath: string | undefined;
+		try {
+			const stored = await getPluginSettings(PLUGIN_NAME, cwd);
+			settingEnabled = stored.audit === true || stored.audit === "true";
+			settingPrompts = stored.auditPrompt === true || stored.auditPrompt === "true";
+			settingPath = typeof stored.auditPath === "string" ? stored.auditPath.trim() : undefined;
+		} catch {
+			// No plugin config (SDK session, absent lockfile): env is the only source.
+		}
+		return {
+			enabled: envEnabled ?? settingEnabled,
+			prompts: envPrompts ?? settingPrompts,
+			path: envPath || settingPath || DEFAULT_AUDIT_PATH,
+		};
+	})().catch(() => ({ enabled: false, prompts: false, path: DEFAULT_AUDIT_PATH }));
+	auditConfigByCwd.set(cwd, pending);
+	return pending;
+}
+
+const auditDirsReady = new Set<string>();
+
+/** Append one JSON line. Never throws: auditing is observational only. */
+function appendAudit(path: string, record: Record<string, unknown>): void {
+	try {
+		const dir = dirname(path);
+		if (!auditDirsReady.has(dir)) {
+			mkdirSync(dir, { recursive: true });
+			auditDirsReady.add(dir);
+		}
+		// O_APPEND on a single small write keeps concurrent sessions from
+		// interleaving partial lines, so the file stays valid JSONL.
+		appendFileSync(path, `${JSON.stringify(record)}\n`);
+	} catch {
+		// Unwritable path, full disk, revoked permission: drop the record.
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	// Settings come from the HOST module instance (`pi.pi`). A plugin-local
 	// `import { settings }` resolves to a second copy of the singleton with no
@@ -375,11 +531,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	/** A judgement plus how it was obtained, for the audit log. */
+	interface Classification extends Judgement {
+		model?: string;
+		latencyMs?: number;
+	}
+
 	const classify = async (
 		ctx: ExtensionContext,
 		command: string,
 		cwd: string,
-	): Promise<Judgement> => {
+	): Promise<Classification> => {
 		// `@tiny` is the role core reserves for online classifier work; it falls
 		// back through the smol chain and then to the session model.
 		const model: Model | undefined = ctx.models?.resolve("@tiny") ?? ctx.model;
@@ -397,6 +559,7 @@ export default function (pi: ExtensionAPI) {
 				`${JSON.stringify({ command, workingDirectory: cwd })}\n${fence}`,
 			timestamp: Date.now(),
 		} satisfies UserMessage;
+		const startedAt = Date.now();
 		const msg = await completeSimple(
 			model,
 			{ systemPrompt: [CLASSIFIER_PROMPT], messages: [promptMessage] },
@@ -411,12 +574,87 @@ export default function (pi: ExtensionAPI) {
 				signal: AbortSignal.timeout(CLASSIFIER_TIMEOUT_MS),
 			},
 		);
-		return parseJudgement(
+		const judgement = parseJudgement(
 			msg.content
 				.filter((c): c is TextContent => c.type === "text")
 				.map(c => c.text)
 				.join(" "),
 		);
+		// Record WHICH model produced the verdict: a review that finds systematic
+		// over-flagging needs to know whether it came from the whole `@tiny` chain
+		// or one weak link in it.
+		return { ...judgement, model: model.id, latencyMs: Date.now() - startedAt };
+	};
+
+	/**
+	 * Last user turn per session, for `auditPrompt`. Kept here rather than read
+	 * from session history so the plugin never has to walk the transcript on the
+	 * hot path; `input` fires only in interactive mode, so a headless run simply
+	 * has no prompt to attach.
+	 */
+	const lastInputBySession = new Map<string, string>();
+
+	pi.on("input", (event, ctx) => {
+		lastInputBySession.set(ctx.sessionManager.getSessionId(), event.text);
+	});
+
+	/**
+	 * Prompt capture is opt-in and capped. `promptTruncated` is explicit so a
+	 * reviewer never mistakes a clipped prompt for the whole request and judges
+	 * intent on half a sentence.
+	 */
+	const promptFields = (config: AuditConfig, ctx: ExtensionContext): Record<string, unknown> => {
+		if (!config.prompts) return {};
+		const text = lastInputBySession.get(ctx.sessionManager.getSessionId());
+		if (text === undefined) return { prompt: null, promptLength: null, promptTruncated: null };
+		return {
+			prompt: text.slice(0, AUDIT_MAX_PROMPT),
+			promptLength: text.length,
+			promptTruncated: text.length > AUDIT_MAX_PROMPT,
+		};
+	};
+
+	/**
+	 * Write one audit record, if auditing is enabled. Awaited by callers so the
+	 * file's line order matches decision order; wrapped so that a logging fault
+	 * can never propagate into the gate.
+	 */
+	const audit = async (
+		ctx: ExtensionContext,
+		branch: AuditBranch,
+		outcome: AuditOutcome,
+		target: BashTarget,
+		telemetry: AuditTelemetry = {},
+	): Promise<void> => {
+		try {
+			const config = await resolveAuditConfig(ctx.cwd);
+			if (!config.enabled) return;
+			appendAudit(config.path, {
+				v: AUDIT_SCHEMA,
+				ts: new Date().toISOString(),
+				sessionId: ctx.sessionManager.getSessionId(),
+				toolCallId: target.toolCallId,
+				branch,
+				outcome,
+				// Verbatim, and bounded by CLASSIFY_MAX_COMMAND upstream — the
+				// reviewer is judging this exact text, so it is never truncated.
+				command: target.command,
+				cwd: target.cwd,
+				envKeys: target.envKeys,
+				pty: target.pty,
+				timeoutSeconds: target.timeout ?? null,
+				async: target.async,
+				rule: telemetry.rule ?? null,
+				verdict: telemetry.verdict ?? null,
+				reason: telemetry.reason ?? null,
+				model: telemetry.model ?? null,
+				cached: telemetry.cached ?? null,
+				latencyMs: telemetry.latencyMs ?? null,
+				...promptFields(config, ctx),
+			});
+		} catch {
+			// Observational only.
+		}
 	};
 
 	/**
@@ -431,19 +669,17 @@ export default function (pi: ExtensionAPI) {
 	 */
 	const requestPermission = async (
 		ctx: ExtensionContext,
-		target: {
-			command: string;
-			cwd: string;
-			envKeys: string[];
-			pty: boolean;
-			timeout: number | undefined;
-			async: boolean;
-		},
+		target: BashTarget,
+		branch: AuditBranch,
 		headline: string,
 		reason: string,
+		telemetry: AuditTelemetry = {},
 	): Promise<{ block: true; reason: string } | undefined> => {
 		const detail = reason ? `${headline}: ${reason}` : headline;
-		if (!ctx.hasUI) return { block: true, reason: `${detail} (headless, blocked)` };
+		if (!ctx.hasUI) {
+			await audit(ctx, branch, "blocked", target, telemetry);
+			return { block: true, reason: `${detail} (headless, blocked)` };
+		}
 		const execution = {
 			command: target.command,
 			workingDirectory: target.cwd,
@@ -464,6 +700,10 @@ export default function (pi: ExtensionAPI) {
 			`Run bash command? — ${detail}`,
 			`Execution details (JSON):\n\n${verbatimExecution}`,
 		);
+		// The human's answer is the ground truth a review compares the verdict
+		// against: a denied prompt confirms the flag, an approved one is the
+		// signal for "flagged too eagerly".
+		await audit(ctx, branch, approved ? "approved" : "denied", target, telemetry);
 		return approved ? undefined : { block: true, reason: `${detail} — denied by user` };
 	};
 
@@ -472,24 +712,42 @@ export default function (pi: ExtensionAPI) {
 		const command = typeof event.input?.command === "string" ? event.input.command : "";
 		if (command.trim() === "") return;
 
-		// Universal bound, before every static-rule/critical/env branch: neither
-		// the classifier nor a permission dialog may approve unseen suffix text.
-		if (command.length > CLASSIFY_MAX_COMMAND) {
-			return {
-				block: true,
-				reason:
-					`bash command blocked: ${command.length} chars exceeds the ` +
-					`${CLASSIFY_MAX_COMMAND}-character review limit`,
-			};
-		}
+		// Built before any decision so that every branch — including the
+		// fail-closed ones that never reach cwd resolution — has something to
+		// audit. `cwd` and `envKeys` are refined once natively resolved.
+		let target: BashTarget = {
+			toolCallId: event.toolCallId,
+			command,
+			cwd: ctx.cwd,
+			envKeys: [],
+			pty: event.input.pty === true,
+			timeout: typeof event.input.timeout === "number" ? event.input.timeout : undefined,
+			async: event.input.async === true,
+		};
 
 		try {
+			// Universal bound, before every static-rule/critical/env branch: neither
+			// the classifier nor a permission dialog may approve unseen suffix text.
+			if (command.length > CLASSIFY_MAX_COMMAND) {
+				const reason =
+					`bash command blocked: ${command.length} chars exceeds the ` +
+					`${CLASSIFY_MAX_COMMAND}-character review limit`;
+				await audit(ctx, "overlength", "blocked", target, { reason });
+				return { block: true, reason };
+			}
+
 			const policy = readHostPolicy();
 			const rule = policy.rules.find(candidate => bashApprovalRuleMatches(command, candidate));
+			const ruleTelemetry: AuditTelemetry = rule
+				? { rule: { match: rule.match, approval: rule.approval } }
+				: {};
 
 			// A deny rule is the one decision that outranks everything natively
 			// (tools/bash.ts:557) — the host blocks the call, nothing to add.
-			if (rule?.approval === "deny" || policy.bashPolicy === "deny") return;
+			if (rule?.approval === "deny" || policy.bashPolicy === "deny") {
+				await audit(ctx, "deny-rule", "host-decides", target, ruleTelemetry);
+				return;
+			}
 
 			// Native bash extracts a bare leading `cd <path> && …` when no
 			// structured cwd was supplied, then resolves cwd with resolveToCwd
@@ -503,14 +761,17 @@ export default function (pi: ExtensionAPI) {
 			// that ExtensionContext does not expose. Passing the raw URL to
 			// resolveToCwd would mislabel it; skipping the gate would fail open.
 			if (cwdInput?.includes("://") || cwdInput?.includes("local:/")) {
-				return { block: true, reason: "bash classifier cannot resolve an internal-URL cwd; command not run" };
+				const reason = "bash classifier cannot resolve an internal-URL cwd; command not run";
+				await audit(ctx, "internal-url-cwd", "blocked", target, { reason });
+				return { block: true, reason };
 			}
 			const cwd = cwdInput ? resolveToCwd(cwdInput, ctx.cwd) : ctx.cwd;
 			const env = canonicalEnv(event.input.env);
 			const pty = event.input.pty === true;
 			const timeout = typeof event.input.timeout === "number" ? event.input.timeout : undefined;
 			const async = event.input.async === true;
-			const target = {
+			target = {
+				toolCallId: event.toolCallId,
 				command,
 				cwd,
 				envKeys: env.keys,
@@ -537,8 +798,10 @@ export default function (pi: ExtensionAPI) {
 				return await requestPermission(
 					ctx,
 					target,
+					"critical-pattern",
 					"critical pattern",
 					"matches a built-in dangerous-command pattern",
+					ruleTelemetry,
 				);
 			}
 
@@ -550,8 +813,10 @@ export default function (pi: ExtensionAPI) {
 				return await requestPermission(
 					ctx,
 					target,
+					"env-override",
 					"environment override",
 					"command runs with caller-supplied env; not classified",
+					ruleTelemetry,
 				);
 			}
 
@@ -559,9 +824,18 @@ export default function (pi: ExtensionAPI) {
 			// decisions still win. A pattern rule's policy outranks a non-deny
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
-			if (rule?.approval === "prompt") return;
-			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) return;
-			if (!rule && policy.bashPolicy === "prompt") return;
+			if (rule?.approval === "prompt") {
+				await audit(ctx, "prompt-rule", "host-decides", target, ruleTelemetry);
+				return;
+			}
+			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
+				await audit(ctx, "narrow-allow", "host-decides", target, ruleTelemetry);
+				return;
+			}
+			if (!rule && policy.bashPolicy === "prompt") {
+				await audit(ctx, "user-policy-prompt", "host-decides", target);
+				return;
+			}
 
 			// Classify every remaining command in every approval mode. The host
 			// has a per-session `autoApprove` flag that forces yolo without
@@ -570,30 +844,101 @@ export default function (pi: ExtensionAPI) {
 			// In write/always-ask this costs a model call before the native prompt,
 			// but never lets an invisible autoApprove bypass this gate.
 			const cached = scoped.get(cacheKey);
-			const judgement = cached ?? (await classify(ctx, command, cwd).catch(() => undefined));
+			const judgement: Classification | undefined =
+				cached ?? (await classify(ctx, command, cwd).catch(() => undefined));
 			if (!judgement) {
 				// Classifier unavailable/timed out. Ask rather than silently run.
 				return await requestPermission(
 					ctx,
 					target,
 					"unclassified",
+					"unclassified",
 					"classifier unavailable",
 				);
 			}
 			if (!cached) remember(scoped, cacheKey, judgement);
 
-			if (judgement.verdict === "SAFE") return;
+			// Telemetry describes how THIS decision was reached. A cache hit has no
+			// model or latency of its own; flagging it keeps a reviewer from reading
+			// repeated identical rows as repeated independent judgements.
+			const telemetry: AuditTelemetry = {
+				verdict: judgement.verdict,
+				reason: judgement.reason,
+				model: cached ? undefined : judgement.model,
+				cached: cached !== undefined,
+				latencyMs: cached ? undefined : judgement.latencyMs,
+			};
+
+			if (judgement.verdict === "SAFE") {
+				// The quiet path. Logged precisely because a review of what was
+				// allowed without asking is how under-flagging gets caught.
+				await audit(ctx, "classified", "ran", target, telemetry);
+				return;
+			}
 			return await requestPermission(
 				ctx,
 				target,
+				"classified",
 				judgement.verdict === "UNSAFE" ? "classified unsafe" : "classifier unsure",
 				judgement.reason,
+				telemetry,
 			);
 		} catch (err) {
 			// Unexpected plugin error: fail closed rather than wave the command
 			// through on a path we cannot vouch for.
-			pi.logger.error(`bash-classifier: ${err instanceof Error ? err.message : String(err)}`);
+			const message = err instanceof Error ? err.message : String(err);
+			pi.logger.error(`bash-classifier: ${message}`);
+			await audit(ctx, "plugin-error", "blocked", target, { reason: message });
 			return { block: true, reason: "bash classifier failed; command not run" };
+		}
+	});
+
+	// The host owns the outcome on every `host-decides` branch above. Recording
+	// its resolution — correlated by `toolCallId` — is what makes the log a
+	// complete answer to "when did it ask me, and what did I say?" rather than
+	// only "when did the plugin ask".
+	pi.on("tool_approval_resolved", async (event, ctx) => {
+		if (event.toolName !== "bash") return;
+		try {
+			const config = await resolveAuditConfig(ctx.cwd);
+			if (!config.enabled) return;
+			appendAudit(config.path, {
+				v: AUDIT_SCHEMA,
+				ts: new Date().toISOString(),
+				sessionId: event.sessionId,
+				toolCallId: event.toolCallId,
+				branch: "host-approval",
+				outcome: event.approved ? "approved" : "denied",
+				reason: event.reason ?? null,
+			});
+		} catch {
+			// Observational only.
+		}
+	});
+
+	// The caller's stated purpose for the call. Only `tool_execution_start`
+	// exposes it — it is absent from `tool_call`, so it structurally cannot reach
+	// the classifier even by accident. Measured: this fires for blocked calls too,
+	// so intent is available whether or not the command ran.
+	//
+	// Emitted as its own row rather than folded into the decision, because it
+	// arrives after the decision is made. It is metadata, not a decision, so it
+	// carries no `outcome`: a reviewer keys on `branch` and joins on `toolCallId`.
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (event.toolName !== "bash" || event.intent === undefined) return;
+		try {
+			const config = await resolveAuditConfig(ctx.cwd);
+			if (!config.enabled) return;
+			appendAudit(config.path, {
+				v: AUDIT_SCHEMA,
+				ts: new Date().toISOString(),
+				sessionId: ctx.sessionManager.getSessionId(),
+				toolCallId: event.toolCallId,
+				branch: "intent",
+				intent: event.intent,
+			});
+		} catch {
+			// Observational only.
 		}
 	});
 
@@ -601,7 +946,11 @@ export default function (pi: ExtensionAPI) {
 	// is shared across concurrent sessions; clearing the whole cache on one
 	// subagent's start/shutdown invalidates another session's cached verdicts.
 	const dropCurrent = (_event: unknown, ctx: ExtensionContext) => {
-		cache.delete(ctx.sessionManager.getSessionId());
+		const sessionId = ctx.sessionManager.getSessionId();
+		cache.delete(sessionId);
+		// The captured prompt is conversation text; drop it on the same boundary
+		// rather than holding it for the life of the process.
+		lastInputBySession.delete(sessionId);
 	};
 	pi.on("session_start", dropCurrent);
 	pi.on("session_before_switch", dropCurrent);
