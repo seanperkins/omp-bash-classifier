@@ -55,9 +55,9 @@
  * plugin throw always blocks. A command the gate could not judge is never
  * silently auto-run.
  */
-import { appendFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { appendFileSync, mkdirSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getPluginSettings } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/loader";
 import { CRITICAL_BASH_PATTERNS } from "@oh-my-pi/pi-coding-agent/tools/bash";
@@ -220,6 +220,143 @@ function parseBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[
  */
 function isBlanketPattern(match: string): boolean {
 	return match.replace(/[*\s]/gu, "").length === 0;
+}
+
+/**
+ * Temp roots a recursive delete may target without the critical short-circuit.
+ *
+ * Both the symlinked and the resolved spelling are listed: on macOS `/tmp` is a
+ * symlink to `/private/tmp` and `tmpdir()` is under `/var/folders`, so checking
+ * against only one form would either reject the spelling people actually type or
+ * accept a path that escapes.
+ */
+function collectTempRoots(): string[] {
+	const roots = new Set<string>();
+	for (const candidate of ["/tmp", tmpdir()]) {
+		const normalized = resolve(candidate);
+		roots.add(normalized);
+		try {
+			roots.add(realpathSync(normalized));
+		} catch {
+			// Absent or unreadable: the lexical form still counts as a root.
+		}
+	}
+	return [...roots];
+}
+
+const TEMP_ROOTS = collectTempRoots();
+
+/**
+ * Narrow a caught filesystem error to "the path does not exist".
+ *
+ * Its own function because it gates a security decision: whether an
+ * unresolvable path may be treated as merely absent. `in`-narrowing keeps the
+ * read checked — an inline cast would assert the shape rather than verify it.
+ */
+function isEnoent(err: unknown): boolean {
+	if (typeof err !== "object" || err === null || !("code" in err)) return false;
+	return err.code === "ENOENT";
+}
+
+/**
+ * True when the command is a single `rm` whose every operand provably lives
+ * inside a temp root — lexically AND physically.
+ *
+ * Native bash treats ANY recursive `rm` with an absolute target as critical
+ * (tools/bash.ts:177), which makes `rm -rf /tmp/scratch` indistinguishable from
+ * `rm -rf /`. This does not grant permission: it only declines to short-circuit
+ * as critical, so the command still reaches the classifier. The caller threads a
+ * `criticalDowngraded` flag so the later pattern-rule exemptions cannot swallow
+ * it before that happens.
+ *
+ * SCOPE, measured: this suppresses only THIS plugin's prompt. The host still
+ * runs `resolveApproval` afterward, where the same native critical pattern
+ * returns `override: true` — which `yolo` drops and the other modes honor. So
+ * under `yolo` a temp-scoped delete runs without asking, and under
+ * `write`/`always-ask` the host asks anyway. The exemption is a `yolo`-mode
+ * convenience, not a universal one, and claiming otherwise overstated it.
+ *
+ * Two layers, because one is not enough:
+ *   - lexical: `resolve()` collapses `..`, so `/tmp/../Users/sean` is refused.
+ *     A `bash.patterns` allow rule cannot do this — `rm -rf /tmp/*` compiles to
+ *     `^rm -rf /tmp/.*$`, whose `.*` spans `..`.
+ *   - physical: `realpathSync` on the nearest existing ancestor, because `rm -R`
+ *     follows intermediate symlinks. Lexical containment alone let
+ *     `/tmp/out -> ~/sites` turn `rm -rf /tmp/out/src` into a delete of
+ *     `~/sites/src`.
+ * Operands carrying shell syntax that expands after this check (`~`, `$`, `{`,
+ * `}`) are refused outright rather than guessed at.
+ */
+export function isTempScopedRecursiveDelete(command: string, cwd: string): boolean {
+	// Anything that can smuggle a second command past this check disqualifies it:
+	// `rm -rf /tmp/x && rm -rf ~` must never reach the exemption.
+	if (hasBashApprovalShellControl(command)) return false;
+	const tokens = command.trim().split(/\s+/u);
+	if (tokens[0] !== "rm") return false;
+	// Defeats coreutils' own refusal to recurse on `/`; never exempt it.
+	if (tokens.includes("--no-preserve-root")) return false;
+	const operands: string[] = [];
+	let afterSeparator = false;
+	for (const token of tokens.slice(1)) {
+		if (!afterSeparator && token === "--") {
+			afterSeparator = true;
+			continue;
+		}
+		if (!afterSeparator && token.startsWith("-")) continue;
+		operands.push(token);
+	}
+	if (operands.length === 0) return false;
+	return operands.every(operand => {
+		// ALLOWLIST, not a reject list. Two rounds of review broke a reject list by
+		// naming a character it had not thought of: first `{`/`}` (brace expansion
+		// produced a second word outside the root), then `\` (bash quote-removal
+		// turns `/tmp/\.\./\.\.` into `/tmp/../..`, while `resolve()` reads the
+		// backslashed segments as ordinary component names and collapses nothing).
+		// Enumerating metacharacters is the wrong shape for this check: what must be
+		// true is that the operand contains nothing the shell will rewrite, and only
+		// an allowlist can state that.
+		//
+		// Globs are excluded from the allowlist entirely, for two independent
+		// reasons. Containment: a glob's expansion is not knowable here, and
+		// permitting it in the final component only (the previous attempt) still
+		// required a second rule about non-final components, which is where round
+		// 2's bypass lived. Blast radius: Claude Code's own auto-mode ruleset blocks
+		// `rm -rf /tmp/*`, `rm -rf /tmp/<prefix>-*` and `find /tmp … -delete` on the
+		// grounds that these directories are shared with other agents and processes,
+		// so a sweep destroys their live working state — "deleting a specific named
+		// path the agent has been working with is fine; deleting by pattern is not."
+		// That is a co-tenancy argument, not a traversal one, and it holds here: a
+		// second concurrent session's scratch dirs live in the same /tmp.
+		if (!/^[A-Za-z0-9._@+,:=\-/]+$/u.test(operand)) return false;
+		// `resolve()` collapses a real `..`, which would silently relocate the
+		// target; refuse it outright instead so the intent stays legible.
+		if (operand.split("/").includes("..")) return false;
+
+		const target = resolve(cwd, operand);
+		// Strictly inside a root: `rm -rf /tmp` itself stays critical.
+		if (!TEMP_ROOTS.some(root => target.startsWith(`${root}/`))) return false;
+
+		// Lexical containment is not physical containment. `rm -R` removes the
+		// hierarchy rooted at each argument, and intermediate components go through
+		// ordinary symlink resolution — so with `/tmp/out -> ~/sites`,
+		// `rm -rf /tmp/out/src` is lexically inside /tmp and physically deletes
+		// ~/sites/src. `/tmp` is world-writable and `ln -s` matches no critical
+		// pattern, so the gated agent can plant that link itself.
+		//
+		// Verify the PARENT physically, and require it to exist. A parent that does
+		// not exist means there is nothing to delete, so refusing costs nothing —
+		// and requiring existence is what removes the climbing loop whose fail-open
+		// behaviour was round 2's critical.
+		const parentPath = target.split("/").slice(0, -1).join("/") || "/";
+		try {
+			const realParent = realpathSync(parentPath);
+			return TEMP_ROOTS.some(root => realParent === root || realParent.startsWith(`${root}/`));
+		} catch {
+			// Unresolvable for ANY reason — absent, unreadable, a symlink loop — is
+			// not a temp-scoped delete. Fail closed; no climbing.
+			return false;
+		}
+	});
 }
 
 /** Mirror of the native user-policy normalizer (tools/approval.ts:46-49). */
@@ -416,6 +553,15 @@ interface AuditTelemetry {
 	cached?: boolean;
 	latencyMs?: number;
 	rule?: { match: string; approval: BashPatternApproval };
+	/**
+	 * This call matched a built-in critical pattern and was downgraded to
+	 * classification by the temp-scope exemption. Recorded because it is the one
+	 * branch that weakens the strongest check in the gate: without it, a
+	 * downgraded hit is indistinguishable in the log from a command that never
+	 * matched a critical pattern at all, which is precisely the case a reviewer
+	 * reading this log needs to find.
+	 */
+	criticalDowngraded?: boolean;
 }
 
 interface AuditConfig {
@@ -650,6 +796,7 @@ export default function (pi: ExtensionAPI) {
 				model: telemetry.model ?? null,
 				cached: telemetry.cached ?? null,
 				latencyMs: telemetry.latencyMs ?? null,
+				criticalDowngraded: telemetry.criticalDowngraded ?? false,
 				...promptFields(config, ctx),
 			});
 		} catch {
@@ -794,7 +941,15 @@ export default function (pi: ExtensionAPI) {
 			// approval mode: the mode cannot be trusted to imply a human, because
 			// a per-session `autoApprove` (wrapper.ts:189-192) forces `yolo`
 			// without appearing in settings at all.
-			if (CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
+			// One narrow exception, and it is a downgrade rather than a grant: a
+			// recursive delete whose every operand provably resolves inside a temp
+			// root falls through to classification instead of short-circuiting here.
+			// The native pattern keys on "recursive rm with an absolute target"
+			// (tools/bash.ts:177), which cannot tell `rm -rf /tmp/scratch` from
+			// `rm -rf /`.
+			const criticalHit = CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
+			const criticalDowngraded = criticalHit && isTempScopedRecursiveDelete(command, cwd);
+			if (criticalHit && !criticalDowngraded) {
 				return await requestPermission(
 					ctx,
 					target,
@@ -804,6 +959,14 @@ export default function (pi: ExtensionAPI) {
 					ruleTelemetry,
 				);
 			}
+
+			// Every audit exit BELOW the critical check must carry the downgrade flag.
+			// The flag exists so a reviewer can find the one branch that weakened the
+			// strongest check; a downgraded command that leaves through the env,
+			// user-policy or unclassified path would otherwise be recorded as an
+			// ordinary call, which is the exact blind spot the field was added to
+			// remove. Found by the review panel's fable seat, round 2.
+			const postCritical: AuditTelemetry = { ...ruleTelemetry, criticalDowngraded };
 
 			// An `env` override selects which program runs (`PATH`, `BASH_ENV`,
 			// `LD_PRELOAD`, `GIT_PAGER`). It therefore outranks a static
@@ -816,7 +979,7 @@ export default function (pi: ExtensionAPI) {
 					"env-override",
 					"environment override",
 					"command runs with caller-supplied env; not classified",
-					ruleTelemetry,
+					postCritical,
 				);
 			}
 
@@ -824,16 +987,22 @@ export default function (pi: ExtensionAPI) {
 			// decisions still win. A pattern rule's policy outranks a non-deny
 			// `tools.approval.bash` policy in native resolveApproval, so apply the
 			// user prompt only when no pattern rule decided the call.
-			if (rule?.approval === "prompt") {
-				await audit(ctx, "prompt-rule", "host-decides", target, ruleTelemetry);
+			// A downgraded critical hit does NOT get these exemptions. Returning
+			// here would hand it to a host that drops the critical override under
+			// `yolo` (tools/approval.ts:156-171) — so with `rm -rf * -> prompt`
+			// configured, the command would get no plugin prompt, no host prompt,
+			// and no classification: strictly weaker than before the downgrade
+			// existed. The downgrade promises classification, so it must reach it.
+			if (rule?.approval === "prompt" && !criticalDowngraded) {
+				await audit(ctx, "prompt-rule", "host-decides", target, postCritical);
 				return;
 			}
-			if (rule?.approval === "allow" && !isBlanketPattern(rule.match)) {
-				await audit(ctx, "narrow-allow", "host-decides", target, ruleTelemetry);
+			if (rule?.approval === "allow" && !isBlanketPattern(rule.match) && !criticalDowngraded) {
+				await audit(ctx, "narrow-allow", "host-decides", target, postCritical);
 				return;
 			}
-			if (!rule && policy.bashPolicy === "prompt") {
-				await audit(ctx, "user-policy-prompt", "host-decides", target);
+			if (!rule && policy.bashPolicy === "prompt" && !criticalDowngraded) {
+				await audit(ctx, "user-policy-prompt", "host-decides", target, postCritical);
 				return;
 			}
 
@@ -854,6 +1023,7 @@ export default function (pi: ExtensionAPI) {
 					"unclassified",
 					"unclassified",
 					"classifier unavailable",
+					postCritical,
 				);
 			}
 			if (!cached) remember(scoped, cacheKey, judgement);
@@ -862,6 +1032,7 @@ export default function (pi: ExtensionAPI) {
 			// model or latency of its own; flagging it keeps a reviewer from reading
 			// repeated identical rows as repeated independent judgements.
 			const telemetry: AuditTelemetry = {
+				...postCritical,
 				verdict: judgement.verdict,
 				reason: judgement.reason,
 				model: cached ? undefined : judgement.model,
