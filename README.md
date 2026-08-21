@@ -109,6 +109,8 @@ Each record carries the evidence (`command` verbatim, native-resolved `cwd`, `en
 
 `branch` names which link in the precedence chain decided: `overlength`, `deny-rule`, `critical-pattern`, `env-override`, `prompt-rule`, `narrow-allow`, `user-policy-prompt`, `classified`, `unclassified`, `internal-url-cwd`, `plugin-error`. `outcome` is `ran`, `approved`, `denied`, `blocked`, or `host-decides`.
 
+`criticalDowngraded: true` marks the one branch that weakens the strongest check: a recursive delete that matched a built-in critical pattern but was sent to classification by the temp-scope exemption. Grep it first when auditing — without the flag it is indistinguishable from a command that never matched a critical pattern at all.
+
 `host-decides` means the plugin deliberately stayed out and the native gate owned the call — do not read it as "the plugin allowed it". Those get a second `branch: "host-approval"` record with the host's real answer, correlated on `toolCallId`:
 
 ```

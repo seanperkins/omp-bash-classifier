@@ -8,7 +8,7 @@
 		"extensions": ["./index.ts"]
 	},
 	"scripts": {
-		"typecheck": "tsc --noEmit --skipLibCheck --module preserve --target esnext --moduleResolution bundler --strict index.ts"
+		"typecheck": "tsc --noEmit --skipLibCheck --module preserve --target esnext --moduleResolution bundler --strict --types bun index.ts eval/run.ts eval/mine-history.ts"
 	},
 	"devDependencies": {
 		"@types/bun": "^1.3.14",

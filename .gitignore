@@ -2,3 +2,15 @@
 
 # typecheck support (symlink to fork's @oh-my-pi) — machine-local, not part of the plugin
 node_modules/
+
+# Mined evaluation data — rebuilt locally by eval/mine-history.ts.
+# NEVER commit: these are real commands from session logs and carry private
+# paths, server addresses, and credential-bearing flags.
+eval/corpus/history.jsonl
+eval/corpus/labels.jsonl
+eval/.cache/
+eval/reports/
+
+# Multi-model review scratch (debate-setup.sh). Holds the frozen changeset and
+# every seat's raw review; useful locally, never part of the plugin.
+.tmp/
