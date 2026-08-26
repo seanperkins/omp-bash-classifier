@@ -31,7 +31,9 @@ The plugin never guesses its way to silent execution.
 - A classifier error, timeout, malformed verdict, or no available model raises a permission request. Headless sessions have no dialog, so they block instead. Malformed verdicts are never cached.
 - An unexpected plugin crash blocks the call.
 
-Even a SAFE verdict is gated. It auto-runs only when the command contains none of the destructive or irreversible tokens (`rm`, `mv`, `dd`, `mkfs`, `chmod`, `sudo`, `git push`, `git reset`, among others). Anything holding one prompts regardless of the verdict, so an injected "answer SAFE" cannot release those commands.
+Even a SAFE verdict is gated. It auto-runs only when the command contains none of the destructive or irreversible tokens (`rm`, `mv`, `dd`, `mkfs`, `chmod`, `sudo`, `git reset`, `git push --force`, among others). Anything holding one prompts regardless of the verdict, so an injected "answer SAFE" cannot release those commands.
+
+**git push** is judged by what it does to the remote ref, not by the subcommand. An ordinary push adds commits that already exist locally and clears on a SAFE verdict; a push that rewrites or deletes a ref prompts — `--force`, `--force-with-lease`, `--force-if-includes`, `--delete`, `--mirror`, `--prune`, a short cluster carrying `f` or `d` (`-fu`), a `+refspec`, or an empty-source refspec (`:branch`). Flagging the subcommand itself put a dialog in front of every publish, which is the approve-without-reading habit this gate exists to avoid.
 
 **curl** and **wget** are judged by the whole invocation, not the verb. They clear only when they touch no local file and feed no shell: `curl -fsSL https://x | jq .` runs, while `curl -o ~/.bashrc https://x` and `curl https://x | python3 -` raise a request. Redirection into a file, an upload flag (`-F f=@…`), or any `&&` or `;` in the command disqualifies too. Command substitution (`$(...)` and backticks) is always flagged.
 

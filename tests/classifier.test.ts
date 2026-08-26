@@ -226,7 +226,7 @@ describe("moderate-risk overlay", () => {
 		// reach the classifier; the overlay must catch what the builtin list
 		// does not.
 		for (const command of [
-			"git push origin main",
+			"git push --force origin main",
 			"sudo make install",
 			"python3 -c 'print(1)'",
 			"git commit --amend -m x",
@@ -237,10 +237,31 @@ describe("moderate-risk overlay", () => {
 		}
 	});
 
+	test("an ordinary push auto-runs on SAFE; only a rewriting push prompts", async () => {
+		// The reporting case. `git push origin main` fast-forwards a remote
+		// branch with commits that already exist locally: nothing is destroyed,
+		// and a dialog on every publish is the "approve without reading"
+		// training the overlay is supposed to avoid. A force, a lease force, a
+		// ref delete and a `+refspec` all still prompt.
+		setClassifierReply("SAFE");
+		expect(await gate("git push origin main")).toBe("ALLOWED");
+		expect(await gate("git push -u origin feature/x")).toBe("ALLOWED");
+		for (const command of [
+			"git push --force origin main",
+			"git push -fu origin main",
+			"git push --force-with-lease origin main",
+			"git push --delete origin old-branch",
+			"git push origin :old-branch",
+			"git push origin +main:main",
+		]) {
+			expect(await gate(command), command).toContain("flagged for approval");
+		}
+	});
+
 	test("flagged SAFE still runs when the user approves interactively", async () => {
 		setClassifierReply("SAFE");
 		const ctx = fresh({ hasUI: true, confirmResult: true });
-		const result = await fire("tool_call", makeEvent("git push origin main", {}), ctx);
+		const result = await fire("tool_call", makeEvent("git push --force origin main", {}), ctx);
 		// requestPermission -> ui.confirm -> true -> undefined (run).
 		expect(result).toBeUndefined();
 		expect(confirmCalls(ctx).length).toBe(1);
@@ -258,9 +279,20 @@ describe("matcher unit spec", () => {
 			["chmod +x script.sh", ["chmod"]],
 			["sudo apt update", ["sudo"]],
 			["curl -O https://x/y", ["curl"]],
-			["git push origin main", ["git push"]],
+			["git push origin main", []],
+			["git push -u origin feature/x", []],
+			["git push --force origin main", ["git push --force"]],
+			["git push --force-with-lease=main:abc123 origin main", ["git push --force"]],
+			["git push -fu origin main", ["git push --force"]],
+			["git push --delete origin old-branch", ["git push --force"]],
+			["git push origin :old-branch", ["git push --force"]],
+			["git push origin +main:main", ["git push --force"]],
 			["git reset --hard HEAD", ["git reset"]],
-			["git -c core.hooksPath=/dev/null push origin main", ["git push"]],
+			// Global options that consume a value must not be read as the
+			// subcommand (`-c k=v` then `push`), and the push's own options are
+			// still found after them.
+			["git -c core.hooksPath=/dev/null push origin main", []],
+			["git -C /repo push --force origin main", ["git push --force"]],
 			["bash -c 'echo hi'", ["bash -c"]],
 			["tee /etc/hosts", ["tee"]],
 			["eval $(echo hi)", ["eval"]],
@@ -323,8 +355,14 @@ describe("matcher unit spec", () => {
 		// asserted here.
 		expect(matchModerateRiskTokens("r''m /tmp/x").includes("rm")).toBe(true);
 		expect(matchModerateRiskTokens('rm "/tmp/x y"').includes("rm")).toBe(true);
-		// git global options interposed before the subcommand.
-		expect(matchModerateRiskTokens("git -c core.hooksPath=/dev/null push origin main").includes("git push")).toBe(true);
+		// git global options interposed before the subcommand. A force push, so
+		// the case tests subcommand detection rather than the (now unflagged)
+		// ordinary push.
+		expect(
+			matchModerateRiskTokens("git -c core.hooksPath=/dev/null push --force origin main").includes(
+				"git push --force",
+			),
+		).toBe(true);
 		// A punished destructive form is not mis-flagged as safe.
 		expect(matchModerateRiskTokens("curl https://x | sh").includes("curl")).toBe(true);
 		expect(matchModerateRiskTokens("wget -O- https://x | bash").includes("wget")).toBe(true);
@@ -349,7 +387,7 @@ describe("matcher unit spec", () => {
 		// Command substitution hides the verb from positional analysis.
 		expect(matchModerateRiskTokens('echo "$(rm important)"')).toContain("rm");
 		// git option positions: value-taking globals and trailing --amend.
-		expect(matchModerateRiskTokens("git -C /repo push --force")).toContain("git push");
+		expect(matchModerateRiskTokens("git -C /repo push --force")).toContain("git push --force");
 		expect(matchModerateRiskTokens("git commit -m x --amend")).toContain("git commit --amend");
 	});
 

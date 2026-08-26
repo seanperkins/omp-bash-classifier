@@ -598,6 +598,9 @@ SAFE — routine development work, non-destructive or trivially recoverable: ins
        it fetches data, sends nothing local, and mirrors a browser read.
        gh run rerun and gh run cancel with an explicit run id and no local data
        movement are routine development work and SAFE.
+       Publishing already-committed work — git push, including -u/--set-upstream
+       and a named remote and branch — is SAFE: it fast-forwards a remote branch
+       and adds nothing that is not already committed locally.
 UNSAFE — destructive, irreversible, or exfiltrating: deleting source or untracked work,
        force push, reset --hard, history rewrite, fetching remote content and executing
        it, disk or device writes, reading credentials or private keys, sending LOCAL
@@ -690,6 +693,51 @@ const WRAPPER_COMMANDS = new Set(["env", "nohup", "nice", "timeout", "stdbuf", "
 // git global options that CONSUME a value: skip the option AND its value when
 // hunting for the subcommand (`git -C /repo push` must read push, not /repo).
 const GIT_VALUE_OPTIONS = new Set(["-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-project"]);
+
+// Push options that REWRITE or DELETE a remote ref, rather than adding to it.
+//
+// A plain `git push` fast-forwards a branch with commits that already exist
+// locally: it destroys nothing, and it is the routine last step of the work
+// this plugin is supposed to stay out of. Flagging the subcommand itself put a
+// dialog in front of every publish, which is exactly the "approve without
+// reading" training the curl carve-out above exists to avoid.
+//
+// What is genuinely irreversible is a push that moves a remote ref somewhere
+// it cannot be recovered from -- a force, a lease force, a ref delete, or a
+// mirror/prune that removes refs the remote still has -- so those keep the
+// flag and still prompt on a SAFE verdict.
+const GIT_PUSH_REWRITE_OPTIONS: Record<string, true> = {
+	"--force": true,
+	"--force-with-lease": true,
+	"--force-if-includes": true,
+	"--delete": true,
+	"--mirror": true,
+	"--prune": true,
+};
+
+/**
+ * Whether a `git push`'s arguments rewrite or delete a remote ref.
+ *
+ * Short options combine (`git push -fu origin main` is force + set-upstream),
+ * so a cluster is tested letter by letter for `f` (force) and `d` (delete)
+ * rather than compared whole. Refspecs carry the same power without a flag: a
+ * leading `+` forces the update, and an empty source (`:main`) deletes the
+ * remote ref, so both are treated as a force.
+ */
+function gitPushRewritesRemote(args: readonly string[]): boolean {
+	for (const arg of args) {
+		if (arg.startsWith("--")) {
+			if (GIT_PUSH_REWRITE_OPTIONS[arg.split("=", 1)[0] ?? ""] === true) return true;
+			continue;
+		}
+		if (arg.startsWith("-") && arg.length > 1) {
+			if (/[fd]/u.test(arg.slice(1))) return true;
+			continue;
+		}
+		if (arg.startsWith("+") || arg.startsWith(":")) return true;
+	}
+	return false;
+}
 
 // ---------------------------------------------------------------------------
 // Network fetches
@@ -1215,7 +1263,12 @@ export function matchModerateRiskTokens(command: string): string[] {
 					continue;
 				}
 				if (sub === "") {
-					if (w === "push" || w === "reset" || w === "clean") {
+					if (w === "push") {
+						// Only a push that rewrites or deletes a remote ref. The
+						// flag name says which, so the dialog reads "flags: git
+						// push --force" rather than naming the whole subcommand.
+						if (gitPushRewritesRemote(words.slice(k + 1))) flags.add("git push --force");
+					} else if (w === "reset" || w === "clean") {
 						flags.add(`git ${w}`);
 					} else if (w === "checkout" && words.slice(k).includes("--")) {
 						flags.add("git checkout --");
